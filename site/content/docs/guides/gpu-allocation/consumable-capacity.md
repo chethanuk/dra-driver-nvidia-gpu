@@ -127,6 +127,9 @@ kubectl get resourceslices -o yaml
 ```
 
 For supported devices, verify that `allowMultipleAllocations` is `true` and that the `memory` or `shares` capacity contains the expected `requestPolicy`.
+Every other capacity, such as `multiprocessors` or `copyEngines`, stays advertised with a `requestPolicy` of `default: 0` and `validValues: [0]`.
+A claim that requests a non-zero amount of one of them cannot be allocated.
+SMs and engines are shared by every claim on the device, not reserved per claim, so a claim's `consumedCapacity` reports them as `0` even though its pods can use all of them.
 
 After creating workloads, inspect their claims:
 

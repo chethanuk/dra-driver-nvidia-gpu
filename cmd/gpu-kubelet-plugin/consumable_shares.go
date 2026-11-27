@@ -65,6 +65,20 @@ func applyConsumableShares(dev *resourceapi.Device, config *Config) {
 	maxMem := resource.NewQuantity(maxBytes, resource.BinarySI)
 	memCap.Value = maxMem.DeepCopy()
 
+	// Only memory and shares are consumable. Pin every other capacity
+	// (multiprocessors, copy engines, ...) to a zero request so a claim does
+	// not consume it in full, while keeping it advertised for CEL selectors.
+	for name, c := range dev.Capacity {
+		if name == "memory" || name == "shares" {
+			continue
+		}
+		c.RequestPolicy = &resourceapi.CapacityRequestPolicy{
+			Default:     new(zero.DeepCopy()),
+			ValidValues: []resource.Quantity{zero.DeepCopy()},
+		}
+		dev.Capacity[name] = c
+	}
+
 	switch sharesOption {
 	case "unlimited":
 		memCap.RequestPolicy = &resourceapi.CapacityRequestPolicy{

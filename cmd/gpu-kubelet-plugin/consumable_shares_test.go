@@ -155,3 +155,121 @@ func TestApplyConsumableShares(t *testing.T) {
 		})
 	}
 }
+
+func TestApplyConsumableSharesNonMemoryCapacities(t *testing.T) {
+	q := resource.MustParse
+	migLike := func() map[resourceapi.QualifiedName]resourceapi.DeviceCapacity {
+		return map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
+			"multiprocessors": {Value: q("152")},
+			"copyEngines":     {Value: q("16")},
+			"decoders":        {Value: q("7")},
+			"encoders":        {Value: q("0")},
+			"jpegEngines":     {Value: q("7")},
+			"ofaEngines":      {Value: q("2")},
+			"memory":          {Value: q("16Gi")},
+		}
+	}
+
+	tests := map[string]struct {
+		featureGate bool
+		flag        string
+		capacity    map[resourceapi.QualifiedName]resourceapi.DeviceCapacity
+		enabled     bool
+		wantShares  bool
+	}{
+		"full GPU with only memory gets no extra capacities in memory mode": {
+			featureGate: true, flag: "memory", enabled: true,
+			capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{"memory": {Value: q("16Gi")}},
+		},
+		"MIG-like device in memory mode pins non-memory capacities to zero": {
+			featureGate: true, flag: "memory", enabled: true, capacity: migLike(),
+		},
+		"MIG-like device in unlimited mode pins non-memory capacities to zero": {
+			featureGate: true, flag: "unlimited", enabled: true, capacity: migLike(),
+		},
+		"MIG-like device in shares mode pins non-memory capacities and keeps shares policy": {
+			featureGate: true, flag: "4", enabled: true, wantShares: true, capacity: migLike(),
+		},
+		"static MIG device memory slices are pinned to zero in unlimited mode": {
+			featureGate: true, flag: "unlimited", enabled: true,
+			capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
+				"memorySlice0":    {Value: q("1")},
+				"memorySlice1":    {Value: q("1")},
+				"multiprocessors": {Value: q("152")},
+				"memory":          {Value: q("16Gi")},
+			},
+		},
+		"feature gate disabled leaves all policies nil": {
+			featureGate: false, flag: "unlimited", capacity: migLike(),
+		},
+		"flag disabled leaves all policies nil": {
+			featureGate: true, flag: "disabled", capacity: migLike(),
+		},
+	}
+
+	// The feature gate is process-wide; restore it so other tests are unaffected.
+	original := featuregates.Enabled(featuregates.ConsumableShares)
+	t.Cleanup(func() {
+		require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{
+			string(featuregates.ConsumableShares): original,
+		}))
+	})
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{
+				string(featuregates.ConsumableShares): tc.featureGate,
+			}))
+			config := &Config{flags: &Flags{consumableShares: tc.flag}}
+
+			input := make(map[resourceapi.QualifiedName]resourceapi.DeviceCapacity, len(tc.capacity))
+			dev := resourceapi.Device{Name: "gpu-0", Capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{}}
+			for k, v := range tc.capacity {
+				input[k] = v
+				dev.Capacity[k] = v
+			}
+
+			applyConsumableShares(&dev, config)
+
+			if !tc.enabled {
+				for k, c := range dev.Capacity {
+					require.Nil(t, c.RequestPolicy, "capacity %q", k)
+				}
+				return
+			}
+
+			for k, in := range input {
+				if k == "memory" {
+					continue
+				}
+				c, ok := dev.Capacity[k]
+				require.True(t, ok, "capacity %q must stay advertised", k)
+				require.Zero(t, c.Value.Cmp(in.Value), "capacity %q value changed", k)
+				require.NotNil(t, c.RequestPolicy, "capacity %q", k)
+				require.NotNil(t, c.RequestPolicy.Default, "capacity %q", k)
+				require.Zero(t, c.RequestPolicy.Default.Cmp(q("0")), "capacity %q default", k)
+				require.Len(t, c.RequestPolicy.ValidValues, 1, "capacity %q", k)
+				require.Zero(t, c.RequestPolicy.ValidValues[0].Cmp(q("0")), "capacity %q valid value", k)
+				require.Nil(t, c.RequestPolicy.ValidRange, "capacity %q", k)
+			}
+
+			require.NotNil(t, dev.Capacity["memory"].RequestPolicy)
+			if !tc.wantShares {
+				require.NotContains(t, dev.Capacity, resourceapi.QualifiedName("shares"))
+			} else {
+				shares := dev.Capacity["shares"]
+				require.NotNil(t, shares.RequestPolicy)
+				require.Zero(t, shares.RequestPolicy.Default.Cmp(q("1")))
+				require.NotNil(t, shares.RequestPolicy.ValidRange)
+				require.Empty(t, shares.RequestPolicy.ValidValues)
+			}
+
+			// No capacity is added or dropped, apart from shares in shares mode.
+			wantLen := len(input)
+			if tc.wantShares {
+				wantLen++
+			}
+			require.Len(t, dev.Capacity, wantLen)
+		})
+	}
+}
