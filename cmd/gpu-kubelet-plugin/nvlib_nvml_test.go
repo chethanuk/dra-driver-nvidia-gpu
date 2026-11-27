@@ -111,6 +111,8 @@ type fakeNVMLGPU struct {
 	giProfile       nvml.GpuInstanceProfileInfo
 	setMigModeCalls []int
 	events          *[]string
+	// getGpuInstancesRet is returned by GetGpuInstances when not SUCCESS.
+	getGpuInstancesRet nvml.Return
 }
 
 func (*fakeNVMLGPU) GetMaxMigDeviceCount() (int, nvml.Return) {
@@ -126,6 +128,18 @@ func (d *fakeNVMLGPU) GetMigDeviceHandleByIndex(int) (nvml.Device, nvml.Return) 
 
 func (d *fakeNVMLGPU) GetGpuInstanceById(int) (nvml.GpuInstance, nvml.Return) {
 	return d.gi, nvml.SUCCESS
+}
+
+// GetGpuInstances models NVML listing the GPU instances of a profile,
+// including ones that have no compute instance (and hence no MIG handle).
+func (d *fakeNVMLGPU) GetGpuInstances(info *nvml.GpuInstanceProfileInfo) ([]nvml.GpuInstance, nvml.Return) {
+	if d.getGpuInstancesRet != nvml.SUCCESS {
+		return nil, d.getGpuInstancesRet
+	}
+	if d.gi == nil || info.Id != d.giProfile.Id {
+		return nil, nvml.SUCCESS
+	}
+	return []nvml.GpuInstance{d.gi}, nvml.SUCCESS
 }
 
 func (d *fakeNVMLGPU) GetGpuInstanceProfileInfo(int) (nvml.GpuInstanceProfileInfo, nvml.Return) {
@@ -526,4 +540,83 @@ func TestDeviceLibInspectMigProfilesAndPlacements(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDeviceLibFindMigDevBySpecGPUInstanceWithoutComputeInstance(t *testing.T) {
+	enableDynamicMIGForTest(t)
+
+	tests := map[string]struct {
+		profileID          int
+		placementStart     int
+		wantGIID           int
+		wantFound          bool
+		getGpuInstancesRet nvml.Return
+	}{
+		"orphan GI matching profile and placement is found": {profileID: 19, placementStart: 2, wantGIID: 3, wantFound: true},
+		"orphan GI at another placement is not matched":     {profileID: 19, placementStart: 4},
+		"orphan GI of another profile is not matched":       {profileID: 14, placementStart: 2},
+		"MIG disabled: no GPU instances is not an error":    {profileID: 19, placementStart: 2, getGpuInstancesRet: nvml.ERROR_NOT_SUPPORTED},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Prepare created the GI, then CI creation failed: the GI exists
+			// but no MIG device handle does (GetMigDeviceHandleByIndex yields
+			// ERROR_NOT_FOUND for every index).
+			gi := &fakeNVMLGpuInstance{
+				info: nvml.GpuInstanceInfo{Id: 3, ProfileId: 19, Placement: nvml.GpuInstancePlacement{Start: 2, Size: 1}},
+			}
+			gpu := &fakeNVMLGPU{gi: gi, giProfile: nvml.GpuInstanceProfileInfo{Id: 19}, getGpuInstancesRet: tc.getGpuInstancesRet}
+			parent := &GpuInfo{UUID: "GPU-1", minor: 1, pciBusID: "0000:01:00.0"}
+			l := deviceLib{
+				nvmllib: &mockNVMLLibrary{
+					deviceGetHandleByUUIDFunc: func(string) (nvml.Device, nvml.Return) { return gpu, nvml.SUCCESS },
+				},
+				gpuInfosByUUID:    map[string]*GpuInfo{parent.UUID: parent},
+				gpuUUIDbyPCIBusID: map[PCIBusID]string{parent.pciBusID: parent.UUID},
+				devhandleByUUID:   make(map[string]nvml.Device),
+			}
+
+			got, err := l.FindMigDevBySpec(&MigSpecTuple{
+				ParentMinor:    parent.minor,
+				ProfileID:      tc.profileID,
+				PlacementStart: tc.placementStart,
+			})
+			require.NoError(t, err)
+			if !tc.wantFound {
+				require.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			require.Equal(t, tc.wantGIID, got.GIID)
+			require.Equal(t, parent.UUID, got.ParentUUID)
+		})
+	}
+}
+
+// Rollback after CI creation failed: the GI is left without a CI and without a
+// MIG device handle, and must still be destroyed.
+func TestDeviceStateRollbackDestroysGPUInstanceWithoutComputeInstance(t *testing.T) {
+	enableDynamicMIGForTest(t)
+
+	var events []string
+	gi := &fakeNVMLGpuInstance{
+		info:                  nvml.GpuInstanceInfo{Id: 3, ProfileId: 19, Placement: nvml.GpuInstancePlacement{Start: 2, Size: 1}},
+		getComputeInstanceRet: nvml.ERROR_NOT_FOUND,
+		events:                &events,
+	}
+	gpu := &fakeNVMLGPU{gi: gi, giProfile: nvml.GpuInstanceProfileInfo{Id: 19}, events: &events}
+	parent := &GpuInfo{UUID: "GPU-1", minor: 1, pciBusID: "0000:01:00.0"}
+	state := &DeviceState{nvdevlib: &deviceLib{
+		nvmllib: &mockNVMLLibrary{
+			deviceGetHandleByUUIDFunc: func(string) (nvml.Device, nvml.Return) { return gpu, nvml.SUCCESS },
+		},
+		gpuInfosByUUID:    map[string]*GpuInfo{parent.UUID: parent},
+		gpuUUIDbyPCIBusID: map[PCIBusID]string{parent.pciBusID: parent.UUID},
+		devhandleByUUID:   make(map[string]nvml.Device),
+	}}
+
+	err := state.deleteMigDevIfExistsAndNotUsedByCompletedClaim(
+		&MigSpecTuple{ParentMinor: parent.minor, ProfileID: 19, PlacementStart: 2}, "gpu-1-mig-1g10gb-19-2", nil)
+	require.NoError(t, err)
+	require.Equal(t, []string{"destroy-gi", "set-mig-mode"}, events)
 }

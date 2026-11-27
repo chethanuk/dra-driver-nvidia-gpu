@@ -1436,7 +1436,8 @@ func (l deviceLib) inspectMigProfilesAndPlacements(gpuInfo *GpuInfo, device nvde
 // `MigSpecTuple` exists. If it exists, a pointer to a corresponding
 // `MigLiveTuple` is returned. If it doesn't exist, a nil pointer is returned.
 // if an NVML API call fails along the way, a nil pointer and a non-nil error is
-// returned.
+// returned. A GPU instance without a compute instance also counts as a match;
+// its `MigLiveTuple` then has CIID 0 and an empty MigUUID.
 func (l deviceLib) FindMigDevBySpec(ms *MigSpecTuple) (*MigLiveTuple, error) {
 	var parentUUID string
 	parentPCIBusID := ms.ParentPCIBusID
@@ -1529,7 +1530,65 @@ func (l deviceLib) FindMigDevBySpec(ms *MigSpecTuple) (*MigLiveTuple, error) {
 		return &mlt, nil
 	}
 
+	// A GI whose CI was never created (e.g. CI creation failed during
+	// Prepare) has no MIG device handle, so the walk above cannot see it.
+	// Look for such a GI directly so that rollback can destroy it.
+	giId, err := findGpuInstanceBySpec(parent, ms)
+	if err != nil {
+		return nil, err
+	}
+	if giId != nil {
+		mlt := MigLiveTuple{
+			ParentMinor:    ms.ParentMinor,
+			ParentPCIBusID: parentPCIBusID,
+			ParentUUID:     parentUUID,
+			GIID:           *giId,
+		}
+		klog.V(4).Infof("FindMigDevBySpec result (GI without CI): %+v", mlt)
+		return &mlt, nil
+	}
+
 	klog.V(4).Infof("Iterated through all potential MIG devs -- no candidate found")
+	return nil, nil
+}
+
+// findGpuInstanceBySpec returns the ID of the GPU instance on `parent` that
+// matches the profile and placement in `ms`, or nil if there is none.
+func findGpuInstanceBySpec(parent nvml.Device, ms *MigSpecTuple) (*int, error) {
+	for i := 0; i < nvml.GPU_INSTANCE_PROFILE_COUNT; i++ {
+		giProfileInfo, ret := parent.GetGpuInstanceProfileInfo(i)
+		if ret == nvml.ERROR_NOT_SUPPORTED || ret == nvml.ERROR_INVALID_ARGUMENT {
+			continue
+		}
+		if ret != nvml.SUCCESS {
+			return nil, fmt.Errorf("error getting GPU instance profile info for profile %d: %w", i, ret)
+		}
+		if int(giProfileInfo.Id) != ms.ProfileID {
+			continue
+		}
+
+		gis, ret := parent.GetGpuInstances(&giProfileInfo)
+		// MIG mode is disabled (e.g. an earlier rollback step destroyed the
+		// last GI and disabled it), so no GI can exist.
+		if ret == nvml.ERROR_NOT_SUPPORTED {
+			return nil, nil
+		}
+		if ret != nvml.SUCCESS {
+			return nil, fmt.Errorf("error getting GPU instances for profile ID %d: %w", ms.ProfileID, ret)
+		}
+		for _, gi := range gis {
+			giInfo, ret := gi.GetInfo()
+			if ret != nvml.SUCCESS {
+				return nil, fmt.Errorf("failed to get GI info: %w", ret)
+			}
+			if int(giInfo.Placement.Start) == ms.PlacementStart {
+				giId := int(giInfo.Id)
+				return &giId, nil
+			}
+		}
+		// Profile IDs are unique, so no other profile can match.
+		return nil, nil
+	}
 	return nil, nil
 }
 
